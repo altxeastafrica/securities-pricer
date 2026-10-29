@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ReferenceDot, BarChart, Bar, ScatterChart, Scatter, Cell, ZAxis,
 } from "recharts";
 import { Plus, Trash2, Download, Building2, Camera, ChevronDown, X, Settings2, CheckSquare, Square, CalendarClock, Layers } from "lucide-react";
+import * as api from "./api.js";
 
 /* ==================================================================
    ALTX SECURITIES PRICER — v4  (bonds + equities)
@@ -135,10 +136,14 @@ function buildBatch(panels, valMs, S) {
 const toCSV = (rows) => [BATCH_COLS.join(","), ...rows.map((r) => BATCH_COLS.map((c) => r[c]).join(","))].join("\n");
 
 /* ---------- persistence ---------- */
+/* Panels, bonds and marks live in Postgres via the API. Only per-browser UI
+   preferences (column visibility, batch template defaults) stay local. */
 const store = {
   async load(k) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch (e) {} return null; },
   async save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
 };
+
+const isNew = (id) => typeof id !== "number";
 function normalize(panels) {
   panels.forEach((p) => { if (!p.kind) p.kind = "bond"; p.bonds.forEach((b) => { if (b.putSell === undefined) { b.putSell = true; b.putBuy = true; } if (b.mm === undefined) b.mm = null; if (b.lastCpn === undefined) b.lastCpn = ""; }); });
   return panels;
@@ -147,7 +152,7 @@ const COLORS = { accent: "#0E5A6B", accentD: "#0B4552", bid: "#0B7A4B", ask: "#B
 const tipStyle = { background: "#fff", border: `1px solid ${COLORS.line}`, borderRadius: 8, fontSize: 12, boxShadow: "0 6px 24px rgba(15,22,32,.08)" };
 
 /* ================================================================== */
-export default function App() {
+function Pricer({ user, onLogout }) {
   const [panels, setPanels] = useState(initialPanels);
   const [today, setToday] = useState(SEED_TODAY);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -155,25 +160,94 @@ export default function App() {
   const [snaps, setSnaps] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [modal, setModal] = useState(null); // {type:'addPanel'|'settings'|'addInst', panel?}
+  const [syncing, setSyncing] = useState(false);
+  const [syncErr, setSyncErr] = useState(null);
   const valMs = parseD(today) + settings.settleDays * MS;
 
+  const savedRef = useRef(null);
+  const timerRef = useRef(null);
+
   useEffect(() => { (async () => {
-    const s = await store.load("altx_state_v6");
-    if (s) { if (s.panels) setPanels(normalize(s.panels));
-      if (s.settings) setSettings({ ...DEFAULT_SETTINGS, ...s.settings, cols: { bond: { ...DEFAULT_COLVIS.bond, ...(s.settings.cols?.bond || {}) } } }); }
-    const sn = await store.load("altx_snaps"); if (sn) setSnaps(sn);
+    const s = await store.load("altx_prefs_v1");
+    if (s && s.settings) setSettings({ ...DEFAULT_SETTINGS, ...s.settings, cols: { bond: { ...DEFAULT_COLVIS.bond, ...(s.settings.cols?.bond || {}) } } });
+    try {
+      const fromApi = await api.loadPanels();
+      setPanels(normalize(fromApi));
+      savedRef.current = JSON.stringify(fromApi);
+    } catch (e) {
+      setSyncErr(e.message);
+    }
     setLoaded(true);
   })(); }, []);
-  useEffect(() => { if (loaded) store.save("altx_state_v6", { panels, settings }); }, [panels, today, settings, loaded]);
+
+  useEffect(() => { if (loaded) store.save("altx_prefs_v1", { settings }); }, [settings, loaded]);
+
+  /* Push changed bonds to the API, debounced so typing a yield doesn't fire a
+     request per keystroke. Only what actually changed is sent. */
+  useEffect(() => {
+    if (!loaded || savedRef.current === null) return;
+    if (JSON.stringify(panels) === savedRef.current) return;
+
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(async () => {
+      const before = JSON.parse(savedRef.current);
+      const prev = new Map();
+      before.forEach((p) => p.bonds.forEach((b) => prev.set(b.id, b)));
+
+      setSyncing(true);
+      try {
+        for (const p of panels) {
+          if (isNew(p.id)) continue;
+          for (const b of p.bonds) {
+            if (isNew(b.id)) { await api.createBond(b, p.id); continue; }
+            const was = prev.get(b.id);
+            if (!was || JSON.stringify(was) !== JSON.stringify(b)) {
+              await api.updateBond(b.id, b, p.id);
+            }
+          }
+        }
+        const fresh = await api.loadPanels();
+        setPanels(normalize(fresh));
+        savedRef.current = JSON.stringify(fresh);
+        setSyncErr(null);
+      } catch (e) {
+        setSyncErr(e.message);
+      } finally {
+        setSyncing(false);
+      }
+    }, 800);
+
+    return () => clearTimeout(timerRef.current);
+  }, [panels, loaded]);
 
   const updatePanel = (pid, patch) => setPanels((ps) => ps.map((p) => p.id === pid ? { ...p, ...patch } : p));
   const updateBond = (pid, bid, patch) => setPanels((ps) => ps.map((p) => p.id !== pid ? p : { ...p, bonds: p.bonds.map((b) => b.id === bid ? { ...b, ...patch } : b) }));
   const bulkUpdate = (pid, ids, fn) => setPanels((ps) => ps.map((p) => p.id !== pid ? p : { ...p, bonds: p.bonds.map((b) => ids.has(b.id) ? { ...b, ...(typeof fn === "function" ? fn(b) : fn) } : b) }));
-  const bulkDelete = (pid, ids) => setPanels((ps) => ps.map((p) => p.id !== pid ? p : { ...p, bonds: p.bonds.filter((b) => !ids.has(b.id)) }));
+  const bulkDelete = (pid, ids) => {
+    ids.forEach((id) => { if (!isNew(id)) api.retireBond(id).catch((e) => setSyncErr(e.message)); });
+    setPanels((ps) => ps.map((p) => p.id !== pid ? p : { ...p, bonds: p.bonds.filter((b) => !ids.has(b.id)) }));
+  };
   const addInstrument = (pid, obj) => setPanels((ps) => ps.map((p) => p.id !== pid ? p : { ...p, bonds: [...p.bonds, { id: uid(), ...obj }] }));
-  const delBond = (pid, bid) => setPanels((ps) => ps.map((p) => p.id !== pid ? p : { ...p, bonds: p.bonds.filter((b) => b.id !== bid) }));
-  const delPanel = (pid) => { setPanels((ps) => ps.filter((p) => p.id !== pid)); setTab("single"); };
-  const addPanel = (name, kind, currency, fxBuy, fxSell) => { const np = { id: uid(), name, kind, currency, isBase: currency === "UGX", fxBuy: +fxBuy || 1, fxSell: +fxSell || 1, bonds: [] }; setPanels((ps) => [...ps, np]); setModal(null); setTab(np.id); };
+  const delBond = (pid, bid) => {
+    if (!isNew(bid)) api.retireBond(bid).catch((e) => setSyncErr(e.message));
+    setPanels((ps) => ps.map((p) => p.id !== pid ? p : { ...p, bonds: p.bonds.filter((b) => b.id !== bid) }));
+  };
+  const delPanel = async (pid) => {
+    setTab("single");
+    try { if (!isNew(pid)) await api.deletePanel(pid); setPanels((ps) => ps.filter((p) => p.id !== pid)); }
+    catch (e) { setSyncErr(e.message); }
+  };
+  const addPanel = async (name, kind, currency, fxBuy, fxSell) => {
+    setModal(null);
+    try {
+      const np = await api.createPanel({ name, kind, currency, fxBuy, fxSell });
+      setPanels((ps) => [...ps, np]);
+      savedRef.current = null;
+      const fresh = await api.loadPanels();
+      setPanels(normalize(fresh)); savedRef.current = JSON.stringify(fresh);
+      setTab(np.id);
+    } catch (e) { setSyncErr(e.message); }
+  };
 
   const batch = useMemo(() => buildBatch(panels, valMs, settings), [panels, valMs, settings]);
   const saveSnapshot = () => {
@@ -195,6 +269,9 @@ export default function App() {
           <button className="btn ghost" onClick={() => setModal({ type: "settings" })}><Settings2 size={15} /> Settings</button>
           <button className="btn ghost" onClick={saveSnapshot}><Camera size={15} /> Save snapshot</button>
           <button className="btn primary" onClick={() => setTab("batch")}><Layers size={15} /> Batch orders</button>
+          <span className="syncbox">{syncErr ? <span className="syncerr" title={syncErr}>not saved</span> : syncing ? <span className="muted sm">saving…</span> : <span className="muted sm">saved</span>}</span>
+          <span className="muted sm">{user.username}</span>
+          <button className="btn ghost sm" onClick={onLogout}>Log out</button>
         </div>
       </header>
 
@@ -522,6 +599,12 @@ h4{margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;c
 .panelctl{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}
 .ccy{font-family:ui-monospace,monospace;font-size:11px;font-weight:600;color:var(--accent);background:#dcebee;padding:2px 8px;border-radius:6px;margin-left:6px}
 .ccy.equity{color:var(--bid);background:#e2efe8}
+.loginwrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.logincard{background:#fff;border:1px solid var(--line);border-radius:14px;padding:28px;width:340px;display:flex;flex-direction:column;gap:14px;box-shadow:0 10px 40px rgba(15,22,32,.06)}
+.logincard .brand{margin-bottom:6px}
+.loginerr{color:var(--ask);font-size:13px}
+.syncbox{margin-left:8px}
+.syncerr{color:var(--ask);font-size:12px;font-weight:600}
 .bumpbox{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;padding:5px 8px;background:var(--surface)}
 .bumpin{width:52px;font-family:ui-monospace,monospace;text-align:right;border:1px solid var(--line);border-radius:5px;padding:4px 6px;font-size:12px}
 
@@ -619,3 +702,53 @@ table.ro td.ask.b{color:var(--ask)}table.ro td.bid.b{color:var(--bid)}
 
 @media(max-width:1000px){.charts{grid-template-columns:1fr}.setgrid,.setgrid.three{grid-template-columns:1fr 1fr}}
 `;
+
+
+/* ================================================================== */
+function Login({ onIn }) {
+  const [u, setU] = useState(""), [p, setP] = useState("");
+  const [err, setErr] = useState(null), [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (!u.trim() || !p) { setErr("Enter a username and password."); return; }
+    setBusy(true); setErr(null);
+    try { onIn(await api.login(u.trim(), p)); }
+    catch (e) { setErr(e.status === 401 ? "Incorrect username or password." : e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="app">
+      <style>{CSS}</style>
+      <div className="loginwrap">
+        <div className="logincard">
+          <div className="brand"><div className="mark">ALTX</div><div><div className="title">Securities Pricer</div><div className="sub">Depository pricing &amp; batch order desk</div></div></div>
+          <label className="field"><span>Username</span>
+            <input value={u} autoFocus onChange={(e) => { setU(e.target.value); setErr(null); }}
+                   onKeyDown={(e) => e.key === "Enter" && submit()} /></label>
+          <label className="field"><span>Password</span>
+            <input type="password" value={p} onChange={(e) => { setP(e.target.value); setErr(null); }}
+                   onKeyDown={(e) => e.key === "Enter" && submit()} /></label>
+          {err && <div className="loginerr">{err}</div>}
+          <button className="btn primary" disabled={busy} onClick={submit}>{busy ? "Signing in…" : "Sign in"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [checked, setChecked] = useState(false);
+
+  useEffect(() => { (async () => {
+    try { const me = await api.whoami(); if (me.authenticated) setUser(me); } catch (e) {}
+    setChecked(true);
+  })(); }, []);
+
+  const out = async () => { try { await api.logout(); } catch (e) {} setUser(null); };
+
+  if (!checked) return <div className="app"><style>{CSS}</style><div className="loginwrap"><div className="muted">Loading…</div></div></div>;
+  if (!user) return <Login onIn={setUser} />;
+  return <Pricer user={user} onLogout={out} />;
+}

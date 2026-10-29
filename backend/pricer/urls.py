@@ -12,4 +12,6 @@ urlpatterns = [
     path("", include(router.urls)),
     path("run/", views.create_run),
     path("whoami/", views.whoami),
+    path("login/", views.login_view),
+    path("logout/", views.logout_view),
 ]

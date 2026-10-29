@@ -144,3 +144,37 @@ class RunTests(TestCase):
         self._bond(ytm_ask=0.1135, ytm_bid=0.12)
         run = build_run(self.user, V)
         self.assertFalse(any("crossed" in w for w in run.rows.first().warnings))
+
+
+class AuthEndpointTests(TestCase):
+    def setUp(self):
+        User.objects.create_user("ej", password="correct-horse-staple")
+
+    def test_whoami_anonymous_is_not_an_error(self):
+        r = self.client.get("/api/whoami/")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["authenticated"])
+
+    def test_login_succeeds_and_session_persists(self):
+        r = self.client.post("/api/login/",
+                             {"username": "ej", "password": "correct-horse-staple"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["username"], "ej")
+        self.assertTrue(self.client.get("/api/whoami/").json()["authenticated"])
+
+    def test_bad_password_is_401(self):
+        r = self.client.post("/api/login/", {"username": "ej", "password": "wrong"})
+        self.assertEqual(r.status_code, 401)
+        self.assertFalse(self.client.get("/api/whoami/").json()["authenticated"])
+
+    def test_logout_ends_the_session(self):
+        self.client.post("/api/login/",
+                         {"username": "ej", "password": "correct-horse-staple"})
+        self.client.post("/api/logout/")
+        self.assertFalse(self.client.get("/api/whoami/").json()["authenticated"])
+
+    def test_bonds_require_authentication(self):
+        self.assertEqual(self.client.get("/api/bonds/").status_code, 403)
+        self.client.post("/api/login/",
+                         {"username": "ej", "password": "correct-horse-staple"})
+        self.assertEqual(self.client.get("/api/bonds/").status_code, 200)
